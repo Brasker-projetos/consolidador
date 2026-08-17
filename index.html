@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Consolidador de Balanço e DRE | 2 empresas</title>
+<link rel="icon" type="image/x-icon" href="favicon.ico">
+<link rel="icon" type="image/png" sizes="16x16" href="favicon-16x16.png">
+<link rel="icon" type="image/png" sizes="32x32" href="favicon-32x32.png">
+<link rel="icon" type="image/png" sizes="96x96" href="favicon-96x96.png">
+<link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png">
+<link rel="manifest" href="site.webmanifest">
+<style>
+  :root{ --azul:#1F3864; --azul2:#2E5496; --cinza:#F2F2F2; --borda:#D9D9D9;
+         --ok:#1E7D34; --erro:#C0392B; --alerta:#BF8F00; }
+  *{box-sizing:border-box;}
+  body{font-family:Arial,Helvetica,sans-serif;margin:0;background:#F4F6FB;color:#1b1b1b;}
+  header{background:var(--azul);color:#fff;padding:18px 28px;}
+  header h1{margin:0;font-size:20px;} header p{margin:4px 0 0;font-size:13px;opacity:.85;}
+  main{max-width:1100px;margin:24px auto;padding:0 20px 60px;}
+  .card{background:#fff;border:1px solid var(--borda);border-radius:10px;padding:20px;margin-bottom:20px;box-shadow:0 1px 3px rgba(0,0,0,.05);}
+  .card h2{margin:0 0 14px;font-size:16px;color:var(--azul);}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;}
+  .drop{border:2px dashed var(--azul2);border-radius:8px;padding:16px;text-align:center;cursor:pointer;background:#FAFBFF;transition:.15s;}
+  .drop:hover{background:#EEF2FB;} .drop.ok{border-color:var(--ok);background:#F0FAF2;}
+  .drop b{display:block;color:var(--azul);font-size:13px;margin-bottom:6px;}
+  .drop small{color:#666;font-size:11px;} .drop .fn{display:block;margin-top:8px;font-size:12px;color:var(--ok);font-weight:bold;}
+  input[type=file]{display:none;}
+  button{background:var(--azul);color:#fff;border:0;border-radius:7px;padding:11px 22px;font-size:14px;cursor:pointer;font-weight:bold;}
+  button:hover{background:var(--azul2);} button:disabled{background:#9aa;cursor:not-allowed;}
+  button.sec{background:#fff;color:var(--azul);border:1px solid var(--azul);}
+  table{width:100%;border-collapse:collapse;font-size:13px;}
+  th,td{border:1px solid var(--borda);padding:7px 9px;text-align:left;}
+  th{background:var(--cinza);} td.num{text-align:right;font-variant-numeric:tabular-nums;}
+  .tag{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:bold;}
+  .tag.ok{background:#E3F5E8;color:var(--ok);} .tag.err{background:#FBE6E4;color:var(--erro);}
+  .tag.warn{background:#FFF6DD;color:var(--alerta);}
+  .hidden{display:none;}
+  .diverg{background:#FFF8E6;}
+  .msg{padding:12px 14px;border-radius:7px;margin:10px 0;font-size:13px;}
+  .msg.err{background:#FBE6E4;color:var(--erro);border:1px solid #E8B7B2;}
+  .msg.ok{background:#E3F5E8;color:var(--ok);border:1px solid #B3E0C0;}
+  .actions{display:flex;gap:12px;align-items:center;margin-top:8px;}
+  .sub{font-size:12px;color:#666;margin-top:4px;}
+  .resume{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:12px 0;}
+  .resume div{background:var(--cinza);border-radius:8px;padding:12px;text-align:center;}
+  .resume span{display:block;font-size:11px;color:#666;} .resume b{font-size:18px;color:var(--azul);}
+  select{padding:4px 6px;border-radius:5px;border:1px solid var(--borda);font-size:12px;}
+  .spin{display:inline-block;width:14px;height:14px;border:2px solid #fff;border-top-color:transparent;border-radius:50%;animation:r .7s linear infinite;vertical-align:-2px;margin-right:6px;}
+  @keyframes r{to{transform:rotate(360deg);}}
+</style>
+</head>
+<body>
+<header>
+  <h1>Consolidador de Balanço e DRE</h1>
+  <p>Sobe os 4 Excel (Balanço e DRE de 2 empresas) → consolida com eliminação intercompany → baixa o .xlsx. Tudo no navegador.</p>
+</header>
+<main>
+
+  <!-- 1. Upload -->
+  <div class="card" id="cardUpload">
+    <h2>1 · Arquivos</h2>
+    <div class="grid">
+      <label class="drop" id="dropBalA"><b>Balanço — Empresa A</b><small>.xls ou .xlsx</small><span class="fn"></span><input type="file" accept=".xls,.xlsx" data-k="balA"></label>
+      <label class="drop" id="dropDreA"><b>DRE — Empresa A</b><small>.xls ou .xlsx</small><span class="fn"></span><input type="file" accept=".xls,.xlsx" data-k="dreA"></label>
+      <label class="drop" id="dropBalB"><b>Balanço — Empresa B</b><small>.xls ou .xlsx</small><span class="fn"></span><input type="file" accept=".xls,.xlsx" data-k="balB"></label>
+      <label class="drop" id="dropDreB"><b>DRE — Empresa B</b><small>.xls ou .xlsx</small><span class="fn"></span><input type="file" accept=".xls,.xlsx" data-k="dreB"></label>
+    </div>
+    <div class="actions"><button id="btnAnalisar" disabled>Analisar</button><span class="sub" id="uploadHint">Selecione os 4 arquivos.</span></div>
+    <div id="analiseMsg"></div>
+  </div>
+
+  <!-- 2. Análise -->
+  <div class="card hidden" id="cardAnalise">
+    <h2>2 · Empresas detectadas</h2>
+    <table id="tblEmpresas"><thead><tr><th>Empresa</th><th>CNPJ</th><th>Data</th><th>Total Ativo</th><th>Total Passivo+PL</th><th>Fecha?</th></tr></thead><tbody></tbody></table>
+    <div id="dreCheck" class="sub"></div>
+  </div>
+
+  <!-- 3. Intercompany -->
+  <div class="card hidden" id="cardInter">
+    <h2>3 · Revisão de eliminações intercompany</h2>
+    <p class="sub">Marque o que eliminar. Quando as duas pontas divergem, escolha o tratamento — nada é decidido sozinho.</p>
+    <table id="tblInter"><thead><tr><th>Eliminar?</th><th>Conta A</th><th class="num">Valor A</th><th>Conta B</th><th class="num">Valor B</th><th class="num">Divergência</th><th>Tratamento</th></tr></thead><tbody></tbody></table>
+    <div id="interVazio" class="sub hidden">Nenhum par intercompany detectado automaticamente.</div>
+  </div>
+
+  <!-- 4. Gerar -->
+  <div class="card hidden" id="cardGerar">
+    <h2>4 · Consolidar</h2>
+    <div class="actions"><button id="btnGerar">Gerar consolidação</button><span class="sub" id="gerarHint"></span></div>
+    <div id="resultado"></div>
+  </div>
+
+</main>
+
+<script src="vendor/xlsx.full.min.js"></script>
+<script src="vendor/exceljs.min.js"></script>
+<script src="js/util.js"></script>
+<script src="js/loader.js"></script>
+<script src="js/parse.js"></script>
+<script src="js/consolidate.js"></script>
+<script src="js/xlsxout.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>
