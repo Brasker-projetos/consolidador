@@ -6,6 +6,27 @@
 
   const NAME_THRESHOLD = 0.6;
 
+  // Limite de empresas por consolidação. Acima disso o relatório deixa de caber
+  // numa leitura confortável (uma coluna por empresa) e a conferência manual,
+  // que é o controle final do contador, fica inviável.
+  const MAX_EMPRESAS = 10;
+  const MIN_EMPRESAS = 2;
+
+  // Toda entrada pública valida a lista antes de calcular: erro cedo e com
+  // texto claro é melhor do que planilha consolidada errada.
+  function checkEmps(emps) {
+    if (!Array.isArray(emps) || !emps.length) throw new Error('Nenhuma empresa recebida para consolidar.');
+    if (emps.length < MIN_EMPRESAS) throw new Error('São necessárias pelo menos ' + MIN_EMPRESAS + ' empresas para consolidar.');
+    if (emps.length > MAX_EMPRESAS) throw new Error('Limite de ' + MAX_EMPRESAS + ' empresas por consolidação.');
+    const ids = new Set();
+    emps.forEach((e, i) => {
+      if (!e || !e.balanco || !e.dre) throw new Error('Empresa ' + ((e && e.id) || (i + 1)) + ': balanço ou DRE não carregados.');
+      if (ids.has(e.id)) throw new Error('Identificador de empresa repetido: ' + e.id + '.');
+      ids.add(e.id);
+    });
+    return emps;
+  }
+
   function sideOf(desc) {
     const n = U.norm(desc);
     if (/(A RECEBER|RECEBER|CLIENTE|CREDITO|MUTUOS?)/.test(n)) return 'receber';
@@ -77,29 +98,29 @@
     return out;
   }
 
-  function financialPositions(empA, empB, pairs) {
+  function financialPositions(emps, pairs) {
+    checkEmps(emps);
     const eliminations = positionEliminations(pairs);
+    const n = emps.length;
     const positions = {};
     Object.keys(POSITION_TYPES).forEach(key => {
       const type = POSITION_TYPES[key], byDesc = new Map();
-      const add = (item, company) => {
+      const add = (item, ci) => {
         const canon = U.norm(item.descricao);
-        if (!byDesc.has(canon)) byDesc.set(canon, { desc: item.descricao, valA: 0, valB: 0, elim: 0 });
+        if (!byDesc.has(canon)) byDesc.set(canon, { desc: item.descricao, vals: new Array(n).fill(0), elim: 0 });
         const line = byDesc.get(canon);
-        line[company] += item.value;
+        line.vals[ci] += item.value;
         line.elim += eliminations.get(item.rowId) || 0;
       };
-      positionRows(empA, type).forEach(item => add(item, 'valA'));
-      positionRows(empB, type).forEach(item => add(item, 'valB'));
+      emps.forEach((emp, ci) => positionRows(emp, type).forEach(item => add(item, ci)));
       const lines = Array.from(byDesc.values()).map(line => {
-        line.soma = line.valA + line.valB;
+        line.soma = line.vals.reduce((s, x) => s + x, 0);
         line.consolidado = line.soma + line.elim;
         return line;
       }).sort((a, b) => a.desc.localeCompare(b.desc, 'pt-BR'));
       positions[key] = {
         title: type.title, lines,
-        totalA: lines.reduce((s, x) => s + x.valA, 0),
-        totalB: lines.reduce((s, x) => s + x.valB, 0),
+        totais: emps.map((e, ci) => lines.reduce((s, x) => s + x.vals[ci], 0)),
         totalElim: lines.reduce((s, x) => s + x.elim, 0),
         total: lines.reduce((s, x) => s + x.consolidado, 0)
       };
@@ -108,37 +129,53 @@
   }
 
   // ---------- Detecção intercompany ----------
-  function detectIntercompany(empA, empB) {
-    const aAll = analytics(empA), bAll = analytics(empB);
-    const nameA = empA.balanco.header.nome, nameB = empB.balanco.header.nome;
-    const cnpjA = U.digits(empA.balanco.header.cnpj), cnpjB = U.digits(empB.balanco.header.cnpj);
+  // Varre todas as combinações de duas empresas (A×B, A×C, B×C…). Uma mesma
+  // conta analítica só pode entrar em UM par: sem essa trava, uma conta cujo
+  // texto lembra o nome de duas empresas seria eliminada duas vezes.
+  function detectIntercompany(emps) {
+    checkEmps(emps);
+    const rowsOf = emps.map(analytics);
+    const nomes = emps.map(e => e.balanco.header.nome);
+    const cnpjs = emps.map(e => U.digits(e.balanco.header.cnpj));
+    const pairs = [], solos = [], soloIds = new Set();
+    const usedRow = new Set();
 
-    const candA = aAll.filter(r => U.nameAppears(r.descricao, nameB) >= NAME_THRESHOLD ||
-      (cnpjB && U.digits(r.descricao).indexOf(cnpjB) >= 0))
-      .map(r => ({ company: 'A', rowId: r.rowId, desc: r.descricao, value: r.saldoAtual, side: sideOf(r.descricao) }));
-    const candB = bAll.filter(r => U.nameAppears(r.descricao, nameA) >= NAME_THRESHOLD ||
-      (cnpjA && U.digits(r.descricao).indexOf(cnpjA) >= 0))
-      .map(r => ({ company: 'B', rowId: r.rowId, desc: r.descricao, value: r.saldoAtual, side: sideOf(r.descricao) }));
+    // Contas da empresa ci que citam o nome ou o CNPJ da empresa cj.
+    const candidatos = (ci, cj) => rowsOf[ci]
+      .filter(r => U.nameAppears(r.descricao, nomes[cj]) >= NAME_THRESHOLD ||
+        (cnpjs[cj] && U.digits(r.descricao).indexOf(cnpjs[cj]) >= 0))
+      .map(r => ({ company: emps[ci].id, companyIndex: ci, rowId: r.rowId,
+        desc: r.descricao, value: r.saldoAtual, side: sideOf(r.descricao) }));
 
-    const pairs = []; const usedA = new Set(), usedB = new Set();
-    candA.forEach((a, ia) => {
-      let best = -1, bestScore = -1;
-      candB.forEach((b, ib) => {
-        if (usedB.has(ib)) return;
-        let sc = 1;
-        if ((a.side === 'receber' && b.side === 'pagar') || (a.side === 'pagar' && b.side === 'receber')) sc += 2;
-        if (sc > bestScore) { bestScore = sc; best = ib; }
-      });
-      if (best >= 0) {
-        usedA.add(ia); usedB.add(best);
-        const b = candB[best];
-        pairs.push({ a, b, valA: a.value, valB: b.value,
-          confirmavel: Math.min(Math.abs(a.value), Math.abs(b.value)),
-          divergencia: Math.abs(Math.abs(a.value) - Math.abs(b.value)),
-          decisao: 'eliminar', tratamento: 'residual' });
+    for (let i = 0; i < emps.length; i++) {
+      for (let j = i + 1; j < emps.length; j++) {
+        const candA = candidatos(i, j), candB = candidatos(j, i);
+        const usedA = new Set(), usedB = new Set();
+        candA.forEach((a, ia) => {
+          if (usedRow.has(a.rowId)) { usedA.add(ia); return; }
+          let best = -1, bestScore = -1;
+          candB.forEach((b, ib) => {
+            if (usedB.has(ib) || usedRow.has(b.rowId)) return;
+            let sc = 1;
+            if ((a.side === 'receber' && b.side === 'pagar') || (a.side === 'pagar' && b.side === 'receber')) sc += 2;
+            if (sc > bestScore) { bestScore = sc; best = ib; }
+          });
+          if (best >= 0) {
+            usedA.add(ia); usedB.add(best);
+            const b = candB[best];
+            usedRow.add(a.rowId); usedRow.add(b.rowId);
+            pairs.push({ a, b, valA: a.value, valB: b.value,
+              confirmavel: Math.min(Math.abs(a.value), Math.abs(b.value)),
+              divergencia: Math.abs(Math.abs(a.value) - Math.abs(b.value)),
+              decisao: 'eliminar', tratamento: 'residual' });
+          }
+        });
+        const solo = c => { if (!usedRow.has(c.rowId) && !soloIds.has(c.rowId)) { soloIds.add(c.rowId); solos.push(c); } };
+        candA.forEach((a, ia) => { if (!usedA.has(ia)) solo(a); });
+        candB.forEach((b, ib) => { if (!usedB.has(ib)) solo(b); });
       }
-    });
-    return { pairs, soloA: candA.filter((a, i) => !usedA.has(i)), soloB: candB.filter((b, i) => !usedB.has(i)) };
+    }
+    return { pairs, solos };
   }
 
   // ---------- Modelo de seções do balanço ----------
@@ -162,111 +199,6 @@
     return String(s).toLowerCase()
       .replace(/(^|\s|\()([a-zà-ú])/g, (m, p, c) => p + c.toUpperCase())
       .replace(/\b(De|Da|Do|Das|Dos|E|A|O)\b/g, m => m.toLowerCase());
-  }
-
-  // Força o desdobramento de grupos genéricos (ex.: "Disponível" e
-  // "Obrigações") até a conta patrimonial que o usuário precisa enxergar.
-  // Assim Bancos, Clientes/Contas a Receber e Fornecedores aparecem dentro
-  // do próprio balancete, sem criar demonstrativos paralelos ou duplicar saldo.
-  const BALANCETE_HIGHLIGHTS = /\b(CLIENTES?|DUPLICATAS? A RECEBER|CONTAS? A RECEBER|TITULOS? A RECEBER|FORNECEDORES?|DUPLICATAS? A PAGAR|BANCOS?|CONTA CORRENTE)\b/;
-
-  function highlightKind(norm) {
-    if (/\b(CLIENTES?|DUPLICATAS? A RECEBER|CONTAS? A RECEBER|TITULOS? A RECEBER)\b/.test(norm)) return 'clientes';
-    if (/\b(FORNECEDORES?|DUPLICATAS? A PAGAR)\b/.test(norm)) return 'fornecedores';
-    if (/\b(BANCOS?|CONTA CORRENTE)\b/.test(norm)) return 'bancos';
-    return null;
-  }
-
-  // Emite os itens de uma seção, drilando contêineres que tenham intercompany.
-  function sectionItems(rows, l1Idx, sign, other, empId, secKey) {
-    const items = [];
-    const l1Level = rows[l1Idx].level;
-    function processNode(start, end, node, inheritedHighlight, inheritedGroupLabel) {
-      // intercompany no subtree?
-      let icIdx = -1;
-      for (let j = start; j < end; j++) {
-        if (!rows[j].synthetic && U.nameAppears(rows[j].descricao, other) >= NAME_THRESHOLD) { icIdx = j; break; }
-      }
-      if (icIdx < 0 && !node.synthetic && U.nameAppears(node.descricao, other) >= NAME_THRESHOLD) icIdx = start;
-      let hasHighlightBelow = false;
-      for (let j = start; j < end; j++) {
-        if (BALANCETE_HIGHLIGHTS.test(U.norm(rows[j].descricao))) { hasHighlightBelow = true; break; }
-      }
-      const nodeHighlight = highlightKind(U.norm(node.descricao));
-      const activeHighlight = inheritedHighlight || nodeHighlight || null;
-      // Só uma conta sintética abre um grupo. Uma analítica como "Cliente
-      // Alfa" pode conter a palavra Cliente, mas deve ficar abaixo do grupo
-      // sintético "Clientes", e não criar um grupo novo.
-      const activeGroupLabel = inheritedGroupLabel ||
-        (nodeHighlight && node.synthetic ? node.descricao : null);
-      const nodeIsHighlight = !!nodeHighlight;
-      const mixedIntercompany = icIdx >= 0 && Math.abs(node.saldoAtual - rows[icIdx].saldoAtual) > 0.02;
-      // Contêiner misto com intercompany, ou agrupador genérico que esconde uma
-      // conta destacada (Disponível → Bancos, Obrigações → Fornecedores): desce
-      // um nível, mantendo o saldo apenas uma vez no balanço.
-      // Nas contas destacadas, continua até as analíticas: "Clientes" deixa
-      // de ser uma linha única e passa a listar cada cliente efetivamente em
-      // aberto; a mesma regra vale para fornecedores e bancos.
-      const needsAnalyticDetail = !!activeHighlight && node.synthetic;
-      if ((mixedIntercompany || (hasHighlightBelow && !nodeIsHighlight) || needsAnalyticDetail) && (end - start) > 1) {
-        let k = start + 1;
-        while (k < end && rows[k].level > node.level) {
-          if (rows[k].level === node.level + 1) {
-            let cend = k + 1; while (cend < end && rows[cend].level > rows[k].level) cend++;
-            processNode(k, cend, rows[k], activeHighlight, activeGroupLabel); k = cend;
-          } else k++;
-        }
-      } else {
-        const isInter = icIdx >= 0;
-        items.push({
-          label: isInter ? rows[icIdx].descricao : node.descricao,
-          canon: isInter ? (secKey === 'AC' || secKey === 'ANC' ? 'IC_RECEBER' : 'IC_PAGAR') : U.norm(node.descricao),
-          value: sign * node.saldoAtual, isInter,
-          highlight: activeHighlight,
-          highlightGroup: activeGroupLabel ? {
-            key: activeHighlight + '|' + U.norm(activeGroupLabel), label: activeGroupLabel
-          } : null,
-          rowId: empId + ':' + (isInter ? rows[icIdx].rowIndex : node.rowIndex)
-        });
-      }
-    }
-    let i = l1Idx + 1;
-    while (i < rows.length && rows[i].level > l1Level) {
-      if (rows[i].level === l1Level + 1) {
-        let end = i + 1; while (end < rows.length && rows[end].level > rows[i].level) end++;
-        processNode(i, end, rows[i]); i = end;
-      } else i++;
-    }
-    return items;
-  }
-
-  function buildSections(emp, other) {
-    const rows = emp.balanco.rows;
-    const model = {}; SEC_ORDER.forEach(s => model[s] = { total: 0, items: [] });
-    // Grupos nível-1 fora das seções conhecidas (ex.: bancos/clientes/fornecedores
-    // em aberto, conta de resultado ainda aberta no balanço): o valor já está no
-    // total-raiz do arquivo, então não podem sumir do relatório.
-    const extras = [];
-    let root = null;
-    for (let i = 0; i < rows.length; i++) {
-      const r = rows[i], n = U.norm(r.descricao);
-      if (r.level === 0) { root = /PASSIVO/.test(n) ? 'P' : 'A'; continue; }
-      if (r.level === 1) {
-        const sec = classL1(n, root);
-        if (sec) {
-          const sign = (sec === 'PC' || sec === 'PNC' || sec === 'PL') ? -1 : 1;
-          model[sec].total += sign * r.saldoAtual;
-          model[sec].items = model[sec].items.concat(sectionItems(rows, i, sign, other, emp.id, sec));
-        } else if (r.saldoAtual !== 0 && !/^TOTAL/.test(n)) {
-          const sign = root === 'P' ? -1 : 1;
-          extras.push({ label: r.descricao, canon: n, value: sign * r.saldoAtual,
-            isInter: false, root: root, rowId: emp.id + ':' + r.rowIndex });
-        }
-      }
-    }
-    const ativo = (emp.balanco.totalAtivo || 0);
-    const passivo = -(emp.balanco.totalPassivo || 0);
-    return { model, ativo, passivo, extras };
   }
 
   // ---------- Consolidação do balanço ----------
@@ -326,8 +258,10 @@
     };
   }
 
-  function consolidateBalance(empA, empB, pairs) {
-    const A = balanceTree(empA), B = balanceTree(empB);
+  function consolidateBalance(emps, pairs) {
+    checkEmps(emps);
+    const n = emps.length;
+    const trees = emps.map(balanceTree);
 
     // Eliminação vinculada à conta analítica exata, nunca ao texto genérico
     // da sintética. Isso impede eliminar ou somar contas vizinhas por engano.
@@ -342,9 +276,12 @@
     });
 
     const out = [];
-    const push = (desc, kind, valA, valB, e) => {
-      const soma = (valA || 0) + (valB || 0); const el = e || 0;
-      out.push({ desc, kind, valA: valA || 0, valB: valB || 0, elim: el, soma, consolidado: soma + el });
+    // `vals` tem uma posição por empresa, sempre na ordem de `emps`.
+    const push = (desc, kind, vals, e) => {
+      const v = new Array(n);
+      for (let i = 0; i < n; i++) v[i] = vals[i] || 0;
+      const soma = v.reduce((s, x) => s + x, 0); const el = e || 0;
+      out.push({ desc, kind, vals: v, elim: el, soma, consolidado: soma + el });
     };
     const pushHeader = (desc, kind) => out.push({ desc, kind, header: true });
 
@@ -354,85 +291,79 @@
         (node.children || []).reduce((s, child) => s + eliminationOf(child), 0);
     }
 
-    function emitTrees(aNodes, bNodes, depth) {
-      const bBuckets = new Map();
-      bNodes.forEach((node, i) => {
-        if (!bBuckets.has(node.key)) bBuckets.set(node.key, []);
-        bBuckets.get(node.key).push({ node, i });
+    // Recebe uma lista de nós POR EMPRESA e emite uma linha por conta, casando
+    // pela chave da descrição. As contas da 1ª empresa ditam a ordem; contas
+    // exclusivas de uma empresa seguinte entram na ordem original dela, dentro
+    // do mesmo pai, antes de o relatório avançar para a próxima sintética.
+    function emitTrees(nodeLists, depth) {
+      const buckets = nodeLists.map(list => {
+        const m = new Map();
+        list.forEach((node, i) => {
+          if (!m.has(node.key)) m.set(node.key, []);
+          m.get(node.key).push({ node, i });
+        });
+        return m;
       });
-      const usedB = new Set();
-      const emitPair = (aNode, bNode) => {
-        const childA = aNode ? aNode.children || [] : [];
-        const childB = bNode ? bNode.children || [] : [];
-        const e = eliminationOf(aNode) + eliminationOf(bNode);
-        const hasChildren = childA.length || childB.length;
-        const label = (aNode || bNode).label;
-        push('   '.repeat(depth + 1) + label,
+      const used = nodeLists.map(() => new Set());
+      const emitGroup = group => {
+        const childLists = group.map(nd => (nd && nd.children) ? nd.children : []);
+        const e = group.reduce((s, nd) => s + eliminationOf(nd), 0);
+        const hasChildren = childLists.some(l => l.length);
+        push('   '.repeat(depth + 1) + group.find(Boolean).label,
           hasChildren ? 'subtotal' : (Math.abs(e) > 0.000001 ? 'inter' : 'item'),
-          aNode ? aNode.value : 0, bNode ? bNode.value : 0, e);
-        if (hasChildren) emitTrees(childA, childB, depth + 1);
+          group.map(nd => nd ? nd.value : 0), e);
+        if (hasChildren) emitTrees(childLists, depth + 1);
       };
-      aNodes.forEach(aNode => {
-        const bucket = bBuckets.get(aNode.key) || [];
-        const match = bucket.find(x => !usedB.has(x.i));
-        if (match) usedB.add(match.i);
-        emitPair(aNode, match ? match.node : null);
-      });
-      // Contas exclusivas da Empresa B entram dentro do mesmo pai e na ordem
-      // original de B, antes de o relatório avançar para a próxima sintética.
-      bNodes.forEach((bNode, i) => { if (!usedB.has(i)) emitPair(null, bNode); });
+      for (let ci = 0; ci < nodeLists.length; ci++) {
+        for (let ni = 0; ni < nodeLists[ci].length; ni++) {
+          if (used[ci].has(ni)) continue;
+          used[ci].add(ni);
+          const node = nodeLists[ci][ni];
+          const group = new Array(nodeLists.length).fill(null);
+          group[ci] = node;
+          for (let cj = ci + 1; cj < nodeLists.length; cj++) {
+            const bucket = buckets[cj].get(node.key) || [];
+            const match = bucket.find(x => !used[cj].has(x.i));
+            if (match) { used[cj].add(match.i); group[cj] = match.node; }
+          }
+          emitGroup(group);
+        }
+      }
     }
 
     let ativoElim = 0, passivoElim = 0;
     function emitSection(secKey) {
-      const a = A.sections[secKey], b = B.sections[secKey];
       pushHeader(SEC_NAME[secKey], 'section');
-      emitTrees(a.nodes, b.nodes, 0);
-      const e = a.nodes.reduce((s, x) => s + eliminationOf(x), 0) +
-        b.nodes.reduce((s, x) => s + eliminationOf(x), 0);
-      push('Total do ' + titleCase(SEC_NAME[secKey]), 'subtotal', a.total, b.total, e);
+      const nodeLists = trees.map(t => t.sections[secKey].nodes);
+      emitTrees(nodeLists, 0);
+      const e = nodeLists.reduce((s, list) => s + list.reduce((s2, x) => s2 + eliminationOf(x), 0), 0);
+      push('Total do ' + titleCase(SEC_NAME[secKey]), 'subtotal', trees.map(t => t.sections[secKey].total), e);
       if (secKey === 'AC' || secKey === 'ANC') ativoElim += e; else passivoElim += e;
     }
 
     function emitExtras(rootKey) {
-      emitTrees(A.extras[rootKey], B.extras[rootKey], 0);
+      emitTrees(trees.map(t => t.extras[rootKey]), 0);
     }
 
     pushHeader('ATIVO', 'root');
     emitSection('AC'); emitSection('ANC');
     emitExtras('A');
-    push('TOTAL DO ATIVO', 'grandtotal', A.ativo, B.ativo, ativoElim);
+    push('TOTAL DO ATIVO', 'grandtotal', trees.map(t => t.ativo), ativoElim);
     pushHeader('PASSIVO E PATRIMÔNIO LÍQUIDO', 'root');
     emitSection('PC'); emitSection('PNC'); emitSection('PL');
     emitExtras('P');
-    push('TOTAL DO PASSIVO + PL', 'grandtotal', A.passivo, B.passivo, passivoElim);
+    push('TOTAL DO PASSIVO + PL', 'grandtotal', trees.map(t => t.passivo), passivoElim);
 
-    const totalAtivo = A.ativo + B.ativo + ativoElim;
-    const totalPassivo = A.passivo + B.passivo + passivoElim;
+    const totalAtivo = trees.reduce((s, t) => s + t.ativo, 0) + ativoElim;
+    const totalPassivo = trees.reduce((s, t) => s + t.passivo, 0) + passivoElim;
     const diff = totalAtivo - totalPassivo;
     if (Math.abs(residual) > 0.02) {
-      push('SALDO INTERCOMPANY RESIDUAL NÃO CONCILIADO (ver nota)', 'alerta', 0, 0, 0);
+      push('SALDO INTERCOMPANY RESIDUAL NÃO CONCILIADO (ver nota)', 'alerta', new Array(n).fill(0), 0);
       out[out.length - 1].consolidado = residual;
     }
 
     return { rows: out, totalAtivo, totalPassivo, diff, fecha: Math.abs(diff) <= 0.02, residual };
   }
-
-  function labelFor(it, nameA, nameB) {
-    if (it.canon === 'IC_RECEBER') return 'Mútuos/valores a receber — ' + firstWord(nameB) + ' (intercompany)';
-    if (it.canon === 'IC_PAGAR') return 'Empréstimo/valores a pagar — ' + firstWord(nameB) + ' (intercompany)';
-    if (it.highlightGroup) return '      ' + titleCase(it.label);
-    if (it.highlight) {
-      const prefix = { clientes: 'Clientes em aberto', fornecedores: 'Fornecedores em aberto', bancos: 'Bancos' }[it.highlight];
-      return '      ' + prefix + ' — ' + titleCase(it.label);
-    }
-    const n = U.norm(it.label);
-    if (/\b(CLIENTES?|DUPLICATAS? A RECEBER|CONTAS? A RECEBER|TITULOS? A RECEBER)\b/.test(n)) return '   Clientes em aberto';
-    if (/\b(FORNECEDORES?|DUPLICATAS? A PAGAR)\b/.test(n)) return '   Fornecedores em aberto';
-    if (/\b(BANCOS?|CONTA CORRENTE)\b/.test(n)) return '   Bancos';
-    return '   ' + titleCase(it.label);
-  }
-  function firstWord(s) { return String(s || '').trim().split(/\s+/)[0] || 'coligada'; }
 
   // ---------- Consolidação da DRE (template canônico fixo) ----------
   // A DRE NÃO usa merge posicional de árvores: a hierarquia segue um template
@@ -472,18 +403,18 @@
     return m;
   }
 
-  // Une listas de blocos A/B por chave: ordem canônica preferida (regex, com
-  // sinônimos de grafia) → demais de A na ordem original → só-B na ordem de B.
-  function mergeBlockLists(listA, listB, prefOrder) {
+  // Une as listas de blocos das empresas por chave: ordem canônica preferida
+  // (regex, com sinônimos de grafia) → demais chaves na ordem em que aparecem,
+  // empresa por empresa.
+  function mergeBlockLists(lists, prefOrder) {
     const map = new Map();
-    const put = (b, side) => {
-      if (!map.has(b.key)) map.set(b.key, { key: b.key, descricao: b.descricao, A: null, B: null });
-      map.get(b.key)[side] = b;
+    const put = (b, ci) => {
+      if (!map.has(b.key)) map.set(b.key, { key: b.key, descricao: b.descricao, by: new Array(lists.length).fill(null) });
+      map.get(b.key).by[ci] = b;
     };
-    listA.forEach(b => put(b, 'A')); listB.forEach(b => put(b, 'B'));
+    lists.forEach((list, ci) => list.forEach(b => put(b, ci)));
     const keys = [];
-    listA.forEach(b => { if (keys.indexOf(b.key) < 0) keys.push(b.key); });
-    listB.forEach(b => { if (keys.indexOf(b.key) < 0) keys.push(b.key); });
+    lists.forEach(list => list.forEach(b => { if (keys.indexOf(b.key) < 0) keys.push(b.key); }));
     const ordered = [], seen = new Set();
     (prefOrder || []).forEach(re => keys.forEach(k => {
       if (!seen.has(k) && re.test(k)) { ordered.push(map.get(k)); seen.add(k); }
@@ -492,14 +423,18 @@
     return ordered;
   }
 
-  // Une as analíticas de um bloco casado (A primeiro, depois só-B).
-  function mergeAnalytics(merged) {
-    const aList = merged.A ? merged.A.analytics : [], bList = merged.B ? merged.B.analytics : [];
+  // Une as analíticas de um bloco casado: a 1ª empresa dita a ordem, as
+  // seguintes somam na linha de mesma chave ou abrem linha nova no fim.
+  function mergeAnalytics(merged, n) {
     const out = [], idx = new Map();
-    aList.forEach(a => { idx.set(a.key, out.length); out.push({ descricao: a.descricao, valA: num(a.value), valB: 0 }); });
-    bList.forEach(b => {
-      if (idx.has(b.key)) out[idx.get(b.key)].valB += num(b.value);
-      else out.push({ descricao: b.descricao, valA: 0, valB: num(b.value) });
+    merged.by.forEach((blk, ci) => {
+      (blk ? blk.analytics : []).forEach(a => {
+        if (ci > 0 && idx.has(a.key)) { out[idx.get(a.key)].vals[ci] += num(a.value); return; }
+        if (ci === 0 || !idx.has(a.key)) idx.set(a.key, out.length);
+        const vals = new Array(n).fill(0);
+        vals[ci] = num(a.value);
+        out.push({ descricao: a.descricao, vals: vals });
+      });
     });
     return out;
   }
@@ -508,62 +443,71 @@
   const ORDER_DESP = [/^DESPESAS (COM MARKETING|COMERCIA)/, /^DESPESAS ADMINISTRA/,
     /^DESPESAS COM TECNOLOG/, /^DESPESAS COM INFRAESTRUT/];
 
-  function consolidateDRE(empA, empB) {
-    const SA = dreStruct(empA.dre), SB = dreStruct(empB.dre);
+  function consolidateDRE(emps) {
+    checkEmps(emps);
+    const n = emps.length;
+    const S = emps.map(e => dreStruct(e.dre));
+    // Primeiro valor não-nulo entre as empresas (a 1ª que tiver o bloco).
+    const firstOf = sel => { for (let i = 0; i < S.length; i++) { const v = sel(S[i]); if (v) return v; } return null; };
     const lines = [];
-    const row = (desc, kind, valA, valB, comps) => {
-      const va = num(valA), vb = num(valB);
-      lines.push({ desc, kind, valA: va, valB: vb, elim: 0, soma: va + vb, consolidado: va + vb, comps: comps || null });
+    const row = (desc, kind, vals, comps) => {
+      const v = new Array(n);
+      for (let i = 0; i < n; i++) v[i] = num(vals[i]);
+      const soma = v.reduce((s, x) => s + x, 0);
+      lines.push({ desc, kind, vals: v, elim: 0, soma, consolidado: soma, comps: comps || null });
       return lines.length - 1;
     };
     // Bloco sintético: linha do bloco (fórmula = soma das analíticas) + analíticas.
     const emitBlock = (merged, kind) => {
-      const an = mergeAnalytics(merged);
-      const sumA = an.reduce((s, a) => s + a.valA, 0), sumB = an.reduce((s, a) => s + a.valB, 0);
-      const vA = merged.A ? (an.length ? sumA : num(merged.A.value)) : (an.length ? sumA : 0);
-      const vB = merged.B ? (an.length ? sumB : num(merged.B.value)) : (an.length ? sumB : 0);
-      const idx = row(merged.descricao, kind || 'subtotal', vA, vB, null);
-      const comps = an.map(a => row('   ' + a.descricao, 'item', a.valA, a.valB));
+      const an = mergeAnalytics(merged, n);
+      const vals = new Array(n);
+      for (let ci = 0; ci < n; ci++) {
+        vals[ci] = an.length ? an.reduce((s, a) => s + a.vals[ci], 0)
+          : (merged.by[ci] ? num(merged.by[ci].value) : 0);
+      }
+      const idx = row(merged.descricao, kind || 'subtotal', vals, null);
+      const comps = an.map(a => row('   ' + a.descricao, 'item', a.vals));
       if (comps.length) lines[idx].comps = comps;
       return idx;
     };
-    const sumRows = idxs => idxs.reduce((s, i) => [s[0] + lines[i].valA, s[1] + lines[i].valB], [0, 0]);
+    const sumRows = idxs => {
+      const acc = new Array(n).fill(0);
+      idxs.forEach(i => { for (let c = 0; c < n; c++) acc[c] += lines[i].vals[c]; });
+      return acc;
+    };
 
     // 1–2) Receita Bruta e Deduções
-    const rbIdx = emitBlock({ descricao: (SA.receitaBruta || SB.receitaBruta || { descricao: 'RECEITA BRUTA' }).descricao,
-      A: SA.receitaBruta, B: SB.receitaBruta });
-    const dedIdx = emitBlock({ descricao: (SA.deducoes || SB.deducoes || { descricao: 'DEDUÇÕES' }).descricao,
-      A: SA.deducoes, B: SB.deducoes });
+    const rbIdx = emitBlock({ descricao: (firstOf(s => s.receitaBruta) || { descricao: 'RECEITA BRUTA' }).descricao,
+      by: S.map(s => s.receitaBruta) });
+    const dedIdx = emitBlock({ descricao: (firstOf(s => s.deducoes) || { descricao: 'DEDUÇÕES' }).descricao,
+      by: S.map(s => s.deducoes) });
     // 3) Receita Líquida (fórmula)
-    let [a, b] = sumRows([rbIdx, dedIdx]);
-    const rlIdx = row('(=) RECEITA LÍQUIDA', 'total', a, b, [rbIdx, dedIdx]);
+    const rlIdx = row('(=) RECEITA LÍQUIDA', 'total', sumRows([rbIdx, dedIdx]), [rbIdx, dedIdx]);
     // 4) Custos (subgrupos na ordem canônica, depois subtotal por fórmula)
-    const custosM = mergeBlockLists(SA.custos, SB.custos, ORDER_CUSTOS);
+    const custosM = mergeBlockLists(S.map(s => s.custos), ORDER_CUSTOS);
     const cIdxs = custosM.map(mb => emitBlock(mb));
     let custosIdx = -1;
-    if (cIdxs.length) { [a, b] = sumRows(cIdxs); custosIdx = row('CUSTOS', 'subtotal', a, b, cIdxs); }
+    if (cIdxs.length) custosIdx = row('CUSTOS', 'subtotal', sumRows(cIdxs), cIdxs);
     // 5) ROL após custos (fórmula)
     const rol5comps = custosIdx >= 0 ? [rlIdx, custosIdx] : [rlIdx];
-    [a, b] = sumRows(rol5comps);
-    const rol5Idx = row('(=) RESULTADO OPERACIONAL LÍQUIDO', 'total', a, b, rol5comps);
+    const rol5Idx = row('(=) RESULTADO OPERACIONAL LÍQUIDO', 'total', sumRows(rol5comps), rol5comps);
     // 6) Despesas operacionais
-    const despM = mergeBlockLists(SA.despesas, SB.despesas, ORDER_DESP);
+    const despM = mergeBlockLists(S.map(s => s.despesas), ORDER_DESP);
     const dIdxs = despM.map(mb => emitBlock(mb));
     let despIdx = -1;
-    if (dIdxs.length) { [a, b] = sumRows(dIdxs); despIdx = row('DESPESAS OPERACIONAIS', 'subtotal', a, b, dIdxs); }
+    if (dIdxs.length) despIdx = row('DESPESAS OPERACIONAIS', 'subtotal', sumRows(dIdxs), dIdxs);
     // 7) Resultado financeiro (+ blocos operacionais extras, fiéis à origem)
-    const finIdxs = mergeBlockLists(SA.financeiro, SB.financeiro, []).map(mb => emitBlock(mb));
-    const extraIdxs = mergeBlockLists(SA.extras, SB.extras, []).map(mb => emitBlock(mb));
+    const finIdxs = mergeBlockLists(S.map(s => s.financeiro), []).map(mb => emitBlock(mb));
+    const extraIdxs = mergeBlockLists(S.map(s => s.extras), []).map(mb => emitBlock(mb));
     // 8) ROL após despesas (fórmula)
     const rol8comps = [rol5Idx].concat(despIdx >= 0 ? [despIdx] : []).concat(finIdxs).concat(extraIdxs);
-    [a, b] = sumRows(rol8comps);
-    const rol8Idx = rol8comps.length > 1 ? row('(=) RESULTADO OPERACIONAL LÍQUIDO', 'total', a, b, rol8comps) : rol5Idx;
-    // 9) Receitas não operacionais (somente se existir em A ou B)
-    const naoIdxs = mergeBlockLists(SA.naoOper, SB.naoOper, []).map(mb => emitBlock(mb));
+    const rol8Idx = rol8comps.length > 1
+      ? row('(=) RESULTADO OPERACIONAL LÍQUIDO', 'total', sumRows(rol8comps), rol8comps) : rol5Idx;
+    // 9) Receitas não operacionais (somente se existir em alguma empresa)
+    const naoIdxs = mergeBlockLists(S.map(s => s.naoOper), []).map(mb => emitBlock(mb));
     // 10) Lucro líquido (fórmula)
     const llComps = [rol8Idx].concat(naoIdxs);
-    [a, b] = sumRows(llComps);
-    const llIdx = row('(=) LUCRO LÍQUIDO DO EXERCÍCIO', 'grandtotal', a, b, llComps);
+    const llIdx = row('(=) LUCRO LÍQUIDO DO EXERCÍCIO', 'grandtotal', sumRows(llComps), llComps);
 
     // ----- Validação obrigatória (tolerância ≤ R$ 0,02) -----
     const checks = [];
@@ -572,46 +516,47 @@
       const dif = calc - oficial;
       checks.push({ empresa, conta, calc, oficial, dif, ok: Math.abs(dif) <= 0.02 });
     };
-    [['A', empA, 'valA'], ['B', empB, 'valB']].forEach(([rot, emp, col]) => {
+    emps.forEach((emp, ci) => {
       const o = emp.dre.official || {};
-      chk(rot, 'Receita Líquida', lines[rlIdx][col], o.receitaLiquida);
-      chk(rot, 'Resultado Operacional Líquido (após custos)', lines[rol5Idx][col], o.lucroBruto);
-      chk(rot, 'Resultado Operacional Líquido (após despesas)', lines[rol8Idx][col], o.resultadoOperacional);
-      chk(rot, 'Lucro Líquido do Exercício', lines[llIdx][col], o.resultLiquido);
+      chk(emp.id, 'Receita Líquida', lines[rlIdx].vals[ci], o.receitaLiquida);
+      chk(emp.id, 'Resultado Operacional Líquido (após custos)', lines[rol5Idx].vals[ci], o.lucroBruto);
+      chk(emp.id, 'Resultado Operacional Líquido (após despesas)', lines[rol8Idx].vals[ci], o.resultadoOperacional);
+      chk(emp.id, 'Lucro Líquido do Exercício', lines[llIdx].vals[ci], o.resultLiquido);
     });
     // O resultado exibido no consolidado é sempre o recalculado pelas linhas
     // da DRE. Somar "oficiais" ausentes como zero mascara resultado e gera a
     // falsa divergência exibida na tela.
-    const resLiqA = lines[llIdx].valA, resLiqB = lines[llIdx].valB;
+    const resLiq = emps.map((e, ci) => lines[llIdx].vals[ci]);
     const resultLiquido = lines[llIdx].consolidado;
-    const oficialA = (empA.dre.official || {}).resultLiquido;
-    const oficialB = (empB.dre.official || {}).resultLiquido;
-    const temOficialA = typeof oficialA === 'number' && isFinite(oficialA);
-    const temOficialB = typeof oficialB === 'number' && isFinite(oficialB);
-    const resLiqEsperado = temOficialA && temOficialB ? oficialA + oficialB : undefined;
+    const oficiais = emps.map(e => (e.dre.official || {}).resultLiquido);
+    const temOficial = oficiais.map(v => typeof v === 'number' && isFinite(v));
+    const todosOficiais = temOficial.every(Boolean);
+    const resLiqEsperado = todosOficiais ? oficiais.reduce((s, v) => s + v, 0) : undefined;
     if (resLiqEsperado !== undefined)
-      chk('Consolidado', 'Lucro Líquido = A + B', resultLiquido, resLiqEsperado);
+      chk('Consolidado', 'Lucro Líquido = ' + emps.map(e => e.id).join(' + '), resultLiquido, resLiqEsperado);
     const warnings = [];
-    if (!temOficialA || !temOficialB)
+    if (!todosOficiais) {
+      const faltam = emps.filter((e, ci) => !temOficial[ci]).map(e => 'Empresa ' + e.id);
       warnings.push('O Resultado Líquido oficial não foi identificado em ' +
-        (!temOficialA && !temOficialB ? 'ambas as DREs' : (!temOficialA ? 'Empresa A' : 'Empresa B')) +
+        (faltam.length === emps.length ? (emps.length === 2 ? 'ambas as DREs' : 'todas as DREs') : faltam.join(', ')) +
         '; o consolidado exibe o valor recalculado pelas contas analíticas.');
+    }
     const errors = checks.filter(c => !c.ok)
       .map(c => `DRE ${c.empresa}: ${c.conta} recalculado (${U.fmt(c.calc)}) difere do oficial (${U.fmt(c.oficial)}) em ${U.fmt(c.dif)}`);
 
     // ----- Auditoria: sintética == soma das analíticas (por empresa) -----
     const blockAudit = [];
-    [['A', empA], ['B', empB]].forEach(([rot, emp]) => {
+    emps.forEach(emp => {
       (emp.dre.blocks || []).forEach(bk => {
         if (!bk.analytics.length) return;
         const sum = bk.analytics.reduce((s, x) => s + num(x.value), 0);
-        blockAudit.push({ empresa: rot, conta: bk.descricao, sintetico: bk.value, soma: sum,
+        blockAudit.push({ empresa: emp.id, conta: bk.descricao, sintetico: bk.value, soma: sum,
           dif: bk.value - sum, ok: Math.abs(bk.value - sum) <= 0.02 });
       });
     });
 
     const bate = errors.length === 0;
-    return { lines, resLiqA, resLiqB, resLiqEsperado, resultLiquido, bate, errors, warnings, checks, blockAudit };
+    return { lines, resLiq, resLiqEsperado, resultLiquido, bate, errors, warnings, checks, blockAudit };
   }
 
   // ----- Auditoria do balanço: cada sintética == soma dos filhos diretos -----
@@ -632,5 +577,6 @@
     return out;
   }
 
-  global.C = { detectIntercompany, consolidateBalance, consolidateDRE, financialPositions, auditBalance, sideOf };
+  global.C = { detectIntercompany, consolidateBalance, consolidateDRE, financialPositions,
+    auditBalance, sideOf, MAX_EMPRESAS, MIN_EMPRESAS };
 })(typeof window !== 'undefined' ? window : globalThis);

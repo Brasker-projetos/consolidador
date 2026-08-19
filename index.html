@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Consolidador de Balanço e DRE | 2 empresas</title>
+<title>Consolidador de Balanço e DRE | até 10 empresas</title>
 <link rel="icon" type="image/x-icon" href="favicon.ico">
 <link rel="icon" type="image/png" sizes="16x16" href="favicon-16x16.png">
 <link rel="icon" type="image/png" sizes="32x32" href="favicon-32x32.png">
@@ -21,6 +21,11 @@
   .card{background:#fff;border:1px solid var(--borda);border-radius:10px;padding:20px;margin-bottom:20px;box-shadow:0 1px 3px rgba(0,0,0,.05);}
   .card h2{margin:0 0 14px;font-size:16px;color:var(--azul);}
   .grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;}
+  .empresa{border:1px solid var(--borda);border-radius:8px;padding:12px 12px 4px;margin-bottom:12px;background:#FCFDFF;}
+  .empresa h3{margin:0 0 10px;font-size:12px;color:var(--azul);text-transform:uppercase;letter-spacing:.04em;}
+  .qtd{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:16px;padding-bottom:14px;border-bottom:1px solid var(--borda);}
+  .qtd label{font-size:13px;font-weight:bold;color:var(--azul);}
+  .qtd select{padding:6px 9px;font-size:13px;}
   .drop{border:2px dashed var(--azul2);border-radius:8px;padding:16px;text-align:center;cursor:pointer;background:#FAFBFF;transition:.15s;}
   .drop:hover{background:#EEF2FB;} .drop.ok{border-color:var(--ok);background:#F0FAF2;}
   .drop b{display:block;color:var(--azul);font-size:13px;margin-bottom:6px;}
@@ -53,20 +58,20 @@
 <body>
 <header>
   <h1>Consolidador de Balanço e DRE</h1>
-  <p>Sobe os 4 Excel (Balanço e DRE de 2 empresas) → consolida com eliminação intercompany → baixa o .xlsx. Tudo no navegador.</p>
+  <p>Sobe o Balanço e a DRE de cada empresa (de 2 a 10) → consolida com eliminação intercompany → baixa o .xlsx. Tudo no navegador.</p>
 </header>
 <main>
 
   <!-- 1. Upload -->
   <div class="card" id="cardUpload">
     <h2>1 · Arquivos</h2>
-    <div class="grid">
-      <label class="drop" id="dropBalA"><b>Balanço — Empresa A</b><small>.xls ou .xlsx</small><span class="fn"></span><input type="file" accept=".xls,.xlsx" data-k="balA"></label>
-      <label class="drop" id="dropDreA"><b>DRE — Empresa A</b><small>.xls ou .xlsx</small><span class="fn"></span><input type="file" accept=".xls,.xlsx" data-k="dreA"></label>
-      <label class="drop" id="dropBalB"><b>Balanço — Empresa B</b><small>.xls ou .xlsx</small><span class="fn"></span><input type="file" accept=".xls,.xlsx" data-k="balB"></label>
-      <label class="drop" id="dropDreB"><b>DRE — Empresa B</b><small>.xls ou .xlsx</small><span class="fn"></span><input type="file" accept=".xls,.xlsx" data-k="dreB"></label>
+    <div class="qtd">
+      <label for="qtdEmpresas">Quantas empresas vou consolidar?</label>
+      <select id="qtdEmpresas"></select>
+      <span class="sub">De 2 a 10. Cada empresa vira uma coluna na planilha.</span>
     </div>
-    <div class="actions"><button id="btnAnalisar" disabled>Analisar</button><span class="sub" id="uploadHint">Selecione os 4 arquivos.</span></div>
+    <div id="empresasSlots"></div>
+    <div class="actions"><button id="btnAnalisar" disabled>Analisar</button><span class="sub" id="uploadHint">Selecione os arquivos.</span></div>
     <div id="analiseMsg"></div>
   </div>
 
@@ -81,7 +86,7 @@
   <div class="card hidden" id="cardInter">
     <h2>3 · Revisão de eliminações intercompany</h2>
     <p class="sub">Marque o que eliminar. Quando as duas pontas divergem, escolha o tratamento — nada é decidido sozinho.</p>
-    <table id="tblInter"><thead><tr><th>Eliminar?</th><th>Conta A</th><th class="num">Valor A</th><th>Conta B</th><th class="num">Valor B</th><th class="num">Divergência</th><th>Tratamento</th></tr></thead><tbody></tbody></table>
+    <table id="tblInter"><thead><tr><th>Eliminar?</th><th>Conta</th><th class="num">Valor</th><th>Contraparte</th><th class="num">Valor</th><th class="num">Divergência</th><th>Tratamento</th></tr></thead><tbody></tbody></table>
     <div id="interVazio" class="sub hidden">Nenhum par intercompany detectado automaticamente.</div>
   </div>
 

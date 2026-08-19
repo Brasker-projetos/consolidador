@@ -1,4 +1,6 @@
-/* xlsxout.js — gera o .xlsx consolidado no layout da referência (ExcelJS). */
+/* xlsxout.js — gera o .xlsx consolidado no layout da referência (ExcelJS).
+   O número de colunas acompanha o número de empresas consolidadas:
+   Descrição | uma coluna por empresa | Soma | Eliminações | Consolidado. */
 (function (global) {
   'use strict';
   const U = global.U;
@@ -15,24 +17,54 @@
   const borderAll = () => ({ top: thin(), bottom: thin(), left: thin(), right: thin() });
   const round2 = n => Math.round((Number(n) || 0) * 100) / 100;
   const firstWord = s => String(s || '').trim().split(/\s+/)[0] || 'Empresa';
-  function companyLabels(a, b) {
-    const tokens = s => U.norm(s).split(/\s+/).filter(x => x && !/^(LTDA|EIRELI|S\/A|SA)$/.test(x));
-    const ta = tokens(a), tb = tokens(b), setA = new Set(ta), setB = new Set(tb);
-    const la = ta.find(x => !setB.has(x)) || firstWord(a);
-    const lb = tb.find(x => !setA.has(x)) || firstWord(b);
-    return [la, lb];
+
+  // Letra da coluna no Excel (1 → A, 2 → B…). Com 10 empresas o relatório
+  // termina na coluna N, então uma lista fixa de letras não bastaria.
+  function colLetter(n) {
+    let s = '';
+    while (n > 0) { const r = (n - 1) % 26; s = String.fromCharCode(65 + r) + s; n = Math.floor((n - 1) / 26); }
+    return s;
   }
 
-  function titleBlock(ws, titulo, sub) {
-    ws.mergeCells('A1:F1');
+  // Onde fica cada coluna, dado o número de empresas:
+  // 1 = Descrição · 2..n+1 = empresas · n+2 = Soma · n+3 = Eliminações · n+4 = Consolidado
+  function layoutFor(n) {
+    return { n: n, first: 2, soma: n + 2, elim: n + 3, cons: n + 4, last: n + 4 };
+  }
+
+  // Rótulo curto de cada empresa para o cabeçalho da coluna: a primeira palavra
+  // que só aparece no nome dela. Rótulos repetidos deixariam duas colunas com o
+  // mesmo título, então o id da empresa entra como desempate.
+  function companyLabels(nomes, ids) {
+    const tokens = s => U.norm(s).split(/\s+/).filter(x => x && !/^(LTDA|EIRELI|S\/A|SA)$/.test(x));
+    const toks = nomes.map(tokens);
+    const labels = nomes.map((nome, i) => {
+      const outros = new Set();
+      toks.forEach((t, j) => { if (j !== i) t.forEach(x => outros.add(x)); });
+      return toks[i].find(x => !outros.has(x)) || firstWord(nome);
+    });
+    const conta = {};
+    labels.forEach(l => { conta[l] = (conta[l] || 0) + 1; });
+    return labels.map((l, i) => conta[l] > 1 ? l + ' (' + ids[i] + ')' : l);
+  }
+
+  function titleBlock(ws, titulo, sub, L) {
+    const last = colLetter(L.last);
+    ws.mergeCells('A1:' + last + '1');
     const t = ws.getCell('A1'); t.value = titulo;
     t.font = { name: FONT, size: 12, bold: true, color: { argb: COL.branco } };
     t.fill = fill(COL.titulo); t.alignment = { vertical: 'middle', horizontal: 'center' };
     ws.getRow(1).height = 22;
-    ws.mergeCells('A2:F2');
+    ws.mergeCells('A2:' + last + '2');
     const s = ws.getCell('A2'); s.value = sub;
     s.font = { name: FONT, size: 9, italic: true, color: { argb: COL.titulo } };
     s.alignment = { horizontal: 'center' };
+    // Com muitas empresas a lista de nomes não cabe em uma linha só.
+    const largura = 72 + (L.last - 1) * 16.5;
+    if (String(sub).length > largura) {
+      s.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
+      ws.getRow(2).height = 12 + Math.ceil(String(sub).length / largura) * 11;
+    }
   }
 
   function colHeaders(ws, rowNum, labels) {
@@ -48,7 +80,7 @@
   }
 
   // estilo por tipo de linha
-  function styleDataRow(ws, rowNum, kind) {
+  function styleDataRow(ws, rowNum, kind, L) {
     const r = ws.getRow(rowNum);
     let bg = null, bold = false, italic = false, txt = null;
     if (kind === 'root') { bg = COL.raiz; bold = true; txt = COL.titulo; }
@@ -58,7 +90,7 @@
     else if (kind === 'total') { bg = COL.total; bold = true; }
     else if (kind === 'inter') { bg = COL.inter; italic = true; txt = COL.txtInter; }
     else if (kind === 'alerta') { bg = COL.alerta; bold = true; txt = COL.txtAlerta; }
-    for (let c = 1; c <= 6; c++) {
+    for (let c = 1; c <= L.last; c++) {
       const cell = r.getCell(c);
       cell.font = { name: FONT, size: 10, bold, italic, color: txt ? { argb: txt } : undefined };
       if (bg) cell.fill = fill(bg);
@@ -68,102 +100,128 @@
     }
   }
 
-  // escreve uma linha de dados (com fórmulas Soma=B+C e Consolidado=D+E).
+  // Escreve uma linha de dados. Soma = soma das colunas de empresa e
+  // Consolidado = Soma + Eliminações, ambas por fórmula (recalculáveis no Excel).
   // Se line.comps existir (índices das linhas componentes) e `base` for a
-  // primeira linha de dados, B e C saem como fórmula de soma dos componentes.
-  function writeRow(ws, rowNum, line, base) {
+  // primeira linha de dados, cada coluna de empresa sai como fórmula de soma
+  // dos seus componentes.
+  function writeRow(ws, rowNum, line, base, L) {
     const row = ws.getRow(rowNum);
     row.getCell(1).value = line.desc;
-    if (line.header) { styleDataRow(ws, rowNum, line.kind); return; }
+    if (line.header) { styleDataRow(ws, rowNum, line.kind, L); return; }
     if (line.kind === 'alerta') {
-      row.getCell(6).value = round2(line.consolidado);
-      styleDataRow(ws, rowNum, line.kind); return;
+      row.getCell(L.cons).value = round2(line.consolidado);
+      styleDataRow(ws, rowNum, line.kind, L); return;
     }
-    if (line.comps && line.comps.length && base !== undefined) {
-      const f = col => line.comps.map(i => col + (base + i)).join('+');
-      row.getCell(2).value = { formula: f('B'), result: round2(line.valA) };
-      row.getCell(3).value = { formula: f('C'), result: round2(line.valB) };
-    } else {
-      row.getCell(2).value = round2(line.valA);
-      row.getCell(3).value = round2(line.valB);
+    const vals = line.vals || [];
+    const usaComps = line.comps && line.comps.length && base !== undefined;
+    const somaTermos = [];
+    for (let i = 0; i < L.n; i++) {
+      const nCol = L.first + i, letra = colLetter(nCol);
+      if (usaComps) {
+        row.getCell(nCol).value = {
+          formula: line.comps.map(k => letra + (base + k)).join('+'),
+          result: round2(vals[i])
+        };
+      } else {
+        row.getCell(nCol).value = round2(vals[i]);
+      }
+      somaTermos.push(letra + rowNum);
     }
-    row.getCell(4).value = { formula: `B${rowNum}+C${rowNum}`, result: round2(line.soma) };
-    row.getCell(5).value = line.elim ? round2(line.elim) : 0;
-    row.getCell(6).value = { formula: `D${rowNum}+E${rowNum}`, result: round2(line.consolidado) };
-    styleDataRow(ws, rowNum, line.kind);
+    row.getCell(L.soma).value = { formula: somaTermos.join('+'), result: round2(line.soma) };
+    row.getCell(L.elim).value = line.elim ? round2(line.elim) : 0;
+    row.getCell(L.cons).value = {
+      formula: colLetter(L.soma) + rowNum + '+' + colLetter(L.elim) + rowNum,
+      result: round2(line.consolidado)
+    };
+    styleDataRow(ws, rowNum, line.kind, L);
     const descLen = String(line.desc || '').length;
     if (descLen > 68) ws.getRow(rowNum).height = descLen > 125 ? 42 : 29;
   }
 
-  function notesCell(ws, rowNum, text, color) {
-    ws.mergeCells(`A${rowNum}:F${rowNum}`);
-    const c = ws.getCell(`A${rowNum}`); c.value = text;
+  function notesCell(ws, rowNum, text, color, L) {
+    const last = colLetter(L.last);
+    ws.mergeCells('A' + rowNum + ':' + last + rowNum);
+    const c = ws.getCell('A' + rowNum); c.value = text;
     c.font = { name: FONT, size: 9, color: { argb: color || 'FF333333' } };
     c.alignment = { wrapText: true, vertical: 'top' };
     ws.getRow(rowNum).height = Math.min(220, 14 + Math.ceil(text.length / 95) * 13);
   }
 
-  function setupCols(ws) {
+  function setupCols(ws, L) {
     ws.getColumn(1).width = 72;
-    [2, 3, 4, 5, 6].forEach(c => ws.getColumn(c).width = 16.5);
+    for (let c = 2; c <= L.last; c++) ws.getColumn(c).width = 16.5;
   }
 
   // ----- Balanço -----
-  function sheetBalanco(wb, empA, empB, cons, decisions) {
+  function sheetBalanco(wb, emps, cons, decisions) {
     const ws = wb.addWorksheet('Balanço Consolidado', { views: [{ showGridLines: false }] });
-    setupCols(ws);
-    const hA = empA.balanco.header, hB = empB.balanco.header;
-    const data = hA.data || hB.data || '';
-    const labels = companyLabels(hA.nome, hB.nome);
+    const L = layoutFor(emps.length);
+    setupCols(ws, L);
+    const hs = emps.map(e => e.balanco.header);
+    const data = hs.map(h => h.data).find(Boolean) || '';
+    const labels = companyLabels(hs.map(h => h.nome), emps.map(e => e.id));
     titleBlock(ws, 'BALANÇO PATRIMONIAL CONSOLIDADO — Saldos atuais em ' + data,
-      hA.nome + ' + ' + hB.nome + ' — empresas independentes');
+      hs.map(h => h.nome).join(' + ') + ' — empresas independentes', L);
     const hRow = 3;
-    colHeaders(ws, hRow, ['Descrição', labels[0] + ' (R$)', labels[1] + ' (R$)',
-      'Soma (R$)', 'Eliminações (R$)', 'Consolidado (R$)']);
+    colHeaders(ws, hRow, ['Descrição'].concat(labels.map(l => l + ' (R$)'))
+      .concat(['Soma (R$)', 'Eliminações (R$)', 'Consolidado (R$)']));
     ws.views = [{ showGridLines: false, state: 'frozen', ySplit: hRow }];
     let r = hRow + 1;
-    cons.rows.forEach(line => { writeRow(ws, r, line); r++; });
+    cons.rows.forEach(line => { writeRow(ws, r, line, undefined, L); r++; });
 
     // notas
     r++;
+    const rot = id => { const i = emps.findIndex(e => e.id === id); return i >= 0 ? labels[i] : id; };
     const pares = (decisions.pairs || []).filter(p => p.decisao === 'eliminar');
     let nota = 'NOTAS DA CONSOLIDAÇÃO (saldos atuais em ' + data + '):\n' +
       '1) Empresas independentes (sem relação de controle) — consolidação por somatório dos saldos atuais, com eliminação de saldos recíprocos entre elas.\n';
+    // Numeração corrida: o número de pares muda conforme as empresas carregadas.
+    let num = 2;
     pares.forEach(p => {
-      nota += '2) ELIMINAÇÃO INTERCOMPANY: recíproco confirmável de R$ ' + U.fmt(p.confirmavel) + ' eliminado em ambos os lados (' + p.tratamento + ').\n';
-      if (p.divergencia > 0.02)
-        nota += '3) DIVERGÊNCIA: as duas pontas NÃO se conciliam (diferença de R$ ' + U.fmt(p.divergencia) + '). O saldo remanescente permanece registrado e destacado como "Saldo intercompany residual não conciliado". Isso indica ERRO DE ESCRITURAÇÃO na origem — recomenda-se conciliar as contas entre as empresas e corrigir o lançamento.\n';
+      nota += num + ') ELIMINAÇÃO INTERCOMPANY ' + rot(p.a.company) + ' ↔ ' + rot(p.b.company) +
+        ': recíproco confirmável de R$ ' + U.fmt(p.confirmavel) + ' eliminado em ambos os lados (' + p.tratamento + ').\n';
+      num++;
+      if (p.divergencia > 0.02) {
+        nota += num + ') DIVERGÊNCIA: as duas pontas NÃO se conciliam (diferença de R$ ' + U.fmt(p.divergencia) +
+          '). O saldo remanescente permanece registrado e destacado como "Saldo intercompany residual não conciliado". Isso indica ERRO DE ESCRITURAÇÃO na origem — recomenda-se conciliar as contas entre as empresas e corrigir o lançamento.\n';
+        num++;
+      }
     });
-    nota += '4) Valores fiéis aos arquivos anexados; subtotais e totais são calculados por fórmula e recalculáveis.';
-    notesCell(ws, r, nota);
+    nota += num + ') Valores fiéis aos arquivos anexados; subtotais e totais são calculados por fórmula e recalculáveis.';
+    notesCell(ws, r, nota, null, L);
     return ws;
   }
 
   // ----- DRE -----
-  function sheetDRE(wb, empA, empB, dcons) {
+  function sheetDRE(wb, emps, dcons) {
     const ws = wb.addWorksheet('DRE Consolidada', { views: [{ showGridLines: false }] });
-    setupCols(ws);
-    const hA = empA.dre.header, hB = empB.dre.header, data = hA.data || hB.data || '';
-    const labels = companyLabels(hA.nome, hB.nome);
+    const L = layoutFor(emps.length);
+    setupCols(ws, L);
+    const hs = emps.map(e => e.dre.header);
+    const data = hs.map(h => h.data).find(Boolean) || '';
+    const labels = companyLabels(hs.map(h => h.nome), emps.map(e => e.id));
     titleBlock(ws, 'DRE CONSOLIDADA — Saldos atuais do período encerrado em ' + data,
-      hA.nome + ' + ' + hB.nome);
+      hs.map(h => h.nome).join(' + '), L);
     const hRow = 3;
-    colHeaders(ws, hRow, ['Descrição', labels[0] + ' (R$)', labels[1] + ' (R$)',
-      'Soma (R$)', 'Eliminações (R$)', 'Consolidado (R$)']);
+    colHeaders(ws, hRow, ['Descrição'].concat(labels.map(l => l + ' (R$)'))
+      .concat(['Soma (R$)', 'Eliminações (R$)', 'Consolidado (R$)']));
     ws.views = [{ showGridLines: false, state: 'frozen', ySplit: hRow }];
     const base = hRow + 1;
     let r = base;
-    dcons.lines.forEach(line => { writeRow(ws, r, line, base); r++; });
+    dcons.lines.forEach(line => { writeRow(ws, r, line, base, L); r++; });
     r++;
     notesCell(ws, r,
       'NOTAS: 1) Não foram identificadas operações de compra/venda entre as empresas no período — não há eliminação de receitas/custos intercompany na DRE; apenas a soma dos saldos atuais. ' +
-      '2) Resultado Líquido consolidado recalculado pelas contas da DRE: ' + U.fmt(dcons.resLiqA) + ' + ' + U.fmt(dcons.resLiqB) + ' = ' + U.fmt(dcons.resultLiquido) + '. ' +
-      '3) Caso futuramente se identifique faturamento entre as empresas, as receitas/custos correspondentes deverão ser eliminados na coluna de Eliminações.');
+      '2) Resultado Líquido consolidado recalculado pelas contas da DRE: ' +
+      (dcons.resLiq || []).map(v => U.fmt(v)).join(' + ') + ' = ' + U.fmt(dcons.resultLiquido) + '. ' +
+      '3) Caso futuramente se identifique faturamento entre as empresas, as receitas/custos correspondentes deverão ser eliminados na coluna de Eliminações.',
+      null, L);
     return ws;
   }
 
   // ----- Conferência -----
-  function sheetConferencia(wb, empA, empB, cons, dcons, decisions, fileNames) {
+  function sheetConferencia(wb, emps, cons, dcons, decisions, fileNames) {
     const ws = wb.addWorksheet('Conferência e Validação', { views: [{ showGridLines: false }] });
     ws.getColumn(1).width = 46; ws.getColumn(2).width = 20; ws.getColumn(3).width = 20; ws.getColumn(4).width = 22;
     let r = 1;
@@ -181,8 +239,8 @@
 
     title('CONFERÊNCIA E VALIDAÇÃO');
     line('Gerado em: ' + new Date().toLocaleString('pt-BR'));
-    line('Empresa A: ' + empA.balanco.header.nome + ' (CNPJ ' + (empA.balanco.header.cnpjFmt || '-') + ')');
-    line('Empresa B: ' + empB.balanco.header.nome + ' (CNPJ ' + (empB.balanco.header.cnpjFmt || '-') + ')');
+    emps.forEach(e => line('Empresa ' + e.id + ': ' + e.balanco.header.nome +
+      ' (CNPJ ' + (e.balanco.header.cnpjFmt || '-') + ')'));
     if (fileNames) line('Arquivos: ' + fileNames.join(' | '));
     r++;
     title('1) Balanço fecha?');
@@ -191,15 +249,15 @@
     line('Diferença', cons.diff, '', '', { bold: true, bg: cons.fecha ? COL.total : COL.inter });
     line(cons.fecha ? '✓ BALANÇO FECHA' : '✗ NÃO FECHA — bloqueado', '', '', '', { bold: true, txt: cons.fecha ? COL.titulo : COL.txtInter });
     r++;
-    title('2) Resultado Líquido = A + B');
-    line('Resultado Líquido Empresa A', dcons.resLiqA);
-    line('Resultado Líquido Empresa B', dcons.resLiqB);
+    title('2) Resultado Líquido = ' + emps.map(e => e.id).join(' + '));
+    emps.forEach((e, ci) => line('Resultado Líquido Empresa ' + e.id, (dcons.resLiq || [])[ci]));
     line('Resultado Líquido Consolidado', dcons.resultLiquido, '', '', { bold: true, bg: dcons.bate ? COL.total : COL.inter });
     r++;
     title('3) Eliminações intercompany');
-    line('Par (conta A ↔ conta B)', 'Valor A', 'Valor B', 'Decisão', { bold: true, bg: COL.section });
+    line('Par (conta ↔ contraparte)', 'Valor', 'Valor', 'Decisão', { bold: true, bg: COL.section });
     (decisions.pairs || []).forEach(p => {
-      line(short(p.a.desc) + ' ↔ ' + short(p.b.desc), p.valA, p.valB, p.decisao === 'eliminar' ? ('eliminar/' + p.tratamento) : 'manter');
+      line('[' + p.a.company + '] ' + short(p.a.desc) + ' ↔ [' + p.b.company + '] ' + short(p.b.desc),
+        p.valA, p.valB, p.decisao === 'eliminar' ? ('eliminar/' + p.tratamento) : 'manter');
       if (p.divergencia > 0.02) line('   → divergência entre pontas', p.divergencia, '', '', { bg: COL.alerta, txt: COL.txtAlerta, bold: true });
     });
     if (!(decisions.pairs || []).length) line('Nenhuma eliminação aplicada.');
@@ -209,11 +267,11 @@
     title('4) Auditoria — sintéticas × soma das analíticas (Balanço)');
     line('Conta sintética', 'Saldo sintético', 'Soma dos filhos', 'Diferença', { bold: true, bg: COL.section });
     let balDiv = 0;
-    [['A', empA], ['B', empB]].forEach(([rot, emp]) => {
+    emps.forEach(emp => {
       (global.C.auditBalance(emp) || []).forEach(it => {
         if (it.ok) return;
         balDiv++;
-        line('[' + rot + '] ' + short(it.conta), round2(it.sintetico), round2(it.soma), round2(it.dif), { bg: COL.alerta, txt: COL.txtAlerta });
+        line('[' + emp.id + '] ' + short(it.conta), round2(it.sintetico), round2(it.soma), round2(it.dif), { bg: COL.alerta, txt: COL.txtAlerta });
       });
     });
     if (!balDiv) line('OK — todas as sintéticas conferem com a soma das analíticas.', '', '', '', { bold: true, txt: COL.titulo });
@@ -238,12 +296,12 @@
 
   function short(s) { s = String(s || '').trim(); return s.length > 38 ? s.slice(0, 36) + '…' : s; }
 
-  async function generate(empA, empB, cons, dcons, decisions, fileNames) {
+  async function generate(emps, cons, dcons, decisions, fileNames) {
     const wb = new global.ExcelJS.Workbook();
     wb.creator = 'Consolidador'; wb.created = new Date();
-    sheetBalanco(wb, empA, empB, cons, decisions);
-    sheetDRE(wb, empA, empB, dcons);
-    sheetConferencia(wb, empA, empB, cons, dcons, decisions, fileNames);
+    sheetBalanco(wb, emps, cons, decisions);
+    sheetDRE(wb, emps, dcons);
+    sheetConferencia(wb, emps, cons, dcons, decisions, fileNames);
     const buf = await wb.xlsx.writeBuffer();
     return new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
   }
