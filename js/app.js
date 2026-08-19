@@ -235,6 +235,12 @@
       const blocks = [];
       emps.forEach(e => {
         if (e.balanco.fecha === false) blocks.push('Balanço da Empresa ' + e.id + ' não fecha na origem.');
+        // "sem total" não pode passar: sem a linha de total do Ativo/Passivo a
+        // empresa entra ZERADA nas linhas de total do consolidado, enquanto as
+        // contas dela continuam aparecendo no corpo do relatório.
+        else if (e.balanco.fecha === null) blocks.push('Balanço da Empresa ' + e.id +
+          ': não foi possível ler o total do Ativo e do Passivo. Essa empresa entraria zerada ' +
+          'nas linhas de total do consolidado — verifique o arquivo antes de usar.');
       });
       if (!cons.fecha) blocks.push('Balanço consolidado não fecha: diferença R$ ' + U.fmt(cons.diff) + '.');
       avisosDeEntrada().forEach(a => { if (a.erro) blocks.push(a.txt); });

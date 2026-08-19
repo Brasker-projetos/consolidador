@@ -54,14 +54,21 @@
   function findColumns(grid) {
     for (let r = 0; r < grid.length; r++) {
       const row = (grid[r] || []).map(x => U.norm(x));
-      let colDesc = -1, colAtual = -1, colAnterior = -1;
+      // "Descrição" tem PRECEDÊNCIA sobre "Classificação"/"Código"/"Conta".
+      // Quando o relatório é exportado com as duas, a coluna de código vem
+      // antes da descrição; ler "1.1.01" no lugar do nome da conta apaga a
+      // indentação, e sem indentação o sistema perde a hierarquia e não
+      // encontra as linhas de total do Ativo e do Passivo.
+      let colNome = -1, colCodigo = -1, colAtual = -1, colAnterior = -1;
       for (let c = 0; c < row.length; c++) {
         const t = row[c];
-        if (colDesc < 0 && /(DESCRICAO|HISTORICO|CONTA|CLASSIFICACAO)/.test(t)) colDesc = c;
+        if (colNome < 0 && /(DESCRICAO|HISTORICO)/.test(t)) colNome = c;
+        if (colCodigo < 0 && /(CONTA|CLASSIFICACAO|CODIGO)/.test(t)) colCodigo = c;
         if (/SALDO\s*ATUAL/.test(t)) colAtual = c;
         else if (/SALDO\s*ANTERIOR/.test(t)) colAnterior = c;
         else if (colAtual < 0 && /^SALDO$/.test(t)) colAtual = c; // DRE: coluna "Saldo"
       }
+      const colDesc = colNome >= 0 ? colNome : colCodigo;
       if (colAtual >= 0 && (colDesc >= 0 || colAnterior >= 0)) {
         return { headerRow: r, colDesc: colDesc, colAtual: colAtual, colAnterior: colAnterior };
       }
@@ -277,13 +284,27 @@
     if (!found && computed.length) resultLiquido = computed[computed.length - 1].value;
     official.resultLiquido = resultLiquido;
 
+    // Há sistemas contábeis que imprimem os CUSTOS ANTES da Receita Líquida.
+    // Nesses relatórios a Receita Líquida já vem líquida de custos, e conferir
+    // contra (Receita Bruta + Deduções) acusaria divergência numa DRE correta.
+    const idxRL = blocks.findIndex(b => /^RECEITA LIQUIDA/.test(b.key));
+    let custosAntesDaRL = 0, custosVemAntes = false;
+    if (idxRL > 0) {
+      for (let i = 0; i < idxRL; i++) {
+        if (/^(CUSTOS|CMV)/.test(blocks[i].key)) { custosAntesDaRL += blocks[i].value; custosVemAntes = true; }
+      }
+    }
+    official.receitaLiquidaAposCustos = custosVemAntes;
+
     // Sanidade de parsing (não rígida): identidades que devem fechar nos arquivos.
     const sanity = [];
     const rb = (blocks.find(b => /^RECEITAS? BRUTA/.test(b.key)) || {}).value;
     const ded = (blocks.find(b => /^DEDUC/.test(b.key)) || {}).value;
-    if (official.receitaLiquida !== undefined && rb !== undefined && ded !== undefined
-        && Math.abs(official.receitaLiquida - (rb + ded)) > 0.02)
-      sanity.push('Receita Líquida não fecha (RB+Deduções)');
+    if (official.receitaLiquida !== undefined && rb !== undefined && ded !== undefined) {
+      const esperado = rb + ded + (custosVemAntes ? custosAntesDaRL : 0);
+      if (Math.abs(official.receitaLiquida - esperado) > 0.02)
+        sanity.push('Receita Líquida não fecha (RB+Deduções' + (custosVemAntes ? '+Custos' : '') + ')');
+    }
     if (resultLiquido === undefined)
       sanity.push('Resultado Líquido oficial não identificado no arquivo');
 
