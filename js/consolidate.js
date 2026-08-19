@@ -4,7 +4,7 @@
   'use strict';
   const U = global.U;
 
-  const NAME_THRESHOLD = 0.6;
+  const NAME_THRESHOLD = 0.55;
 
   // Limite de empresas por consolidação. Acima disso o relatório deixa de caber
   // numa leitura confortável (uma coluna por empresa) e a conferência manual,
@@ -35,8 +35,25 @@
   }
 
   function analytics(emp) {
-    return (emp.balanco.rows || []).filter(r => !r.synthetic && r.saldoAtual !== 0)
-      .map(r => Object.assign({ rowId: emp.id + ':' + r.rowIndex }, r));
+    // O texto da conta nem sempre diz se ela está no Ativo ou no Passivo
+    // (muitas analíticas trazem somente o nome da contraparte). Guarda o lado
+    // a partir da raiz hierárquica para impedir que duas contas do mesmo lado
+    // sejam tratadas como um saldo recíproco.
+    const out = []; let balanceSide = null;
+    (emp.balanco.rows || []).forEach(r => {
+      if (r.level === 0) {
+        const n = U.norm(r.descricao);
+        balanceSide = /PASSIVO/.test(n) ? 'P' : (/ATIVO/.test(n) ? 'A' : null);
+        return;
+      }
+      if (!r.synthetic && r.saldoAtual !== 0 && balanceSide) {
+        out.push(Object.assign({
+          rowId: emp.id + ':' + r.rowIndex,
+          balanceSide
+        }, r));
+      }
+    });
+    return out;
   }
 
   // ---------- Posições financeiras (clientes, fornecedores e bancos) ----------
@@ -140,12 +157,75 @@
     const pairs = [], solos = [], soloIds = new Set();
     const usedRow = new Set();
 
-    // Contas da empresa ci que citam o nome ou o CNPJ da empresa cj.
-    const candidatos = (ci, cj) => rowsOf[ci]
-      .filter(r => U.nameAppears(r.descricao, nomes[cj]) >= NAME_THRESHOLD ||
-        (cnpjs[cj] && U.digits(r.descricao).indexOf(cnpjs[cj]) >= 0))
-      .map(r => ({ company: emps[ci].id, companyIndex: ci, rowId: r.rowId,
-        desc: r.descricao, value: r.saldoAtual, side: sideOf(r.descricao) }));
+    // A maior parte dos nomes do mesmo grupo repete termos como "LOCAÇÃO DE
+    // EQUIPAMENTOS". Comparar cada par isoladamente faz uma conta "ES SÃO
+    // MATEUS" parecer também com "ES LINHARES" e o primeiro par percorrido
+    // acaba vencendo. Atribui cada analítica à MELHOR contraparte entre todas
+    // as empresas, dando menos peso aos tokens comuns e preservando números
+    // que distinguem filiais ("LINHARES" x "LINHARES 2").
+    const stop = new Set(['DE', 'DA', 'DO', 'DAS', 'DOS', 'E']);
+    const token = t => {
+      if (/^\d+$/.test(t)) return String(parseInt(t, 10));
+      if (/^LOCAC/.test(t)) return 'LOCACAO';
+      if (/^EQUIP/.test(t)) return 'EQUIP';
+      if (/^MAQUIN/.test(t)) return 'MAQUINA';
+      return t;
+    };
+    const tokens = s => Array.from(new Set(U.stripCompany(s).split(' ')
+      .map(token).filter(t => t && !stop.has(t) && (t.length >= 2 || /^\d+$/.test(t)))));
+    const nameTokens = nomes.map(tokens);
+    const freq = new Map();
+    nameTokens.forEach(ts => ts.forEach(t => freq.set(t, (freq.get(t) || 0) + 1)));
+
+    function nameScore(desc, target) {
+      const hay = new Set(tokens(desc));
+      let total = 0, matched = 0, specific = 0;
+      nameTokens[target].forEach(t => {
+        // Termos de atividade econômica ajudam muito pouco a identificar a
+        // pessoa jurídica, mesmo quando aparecem em só duas empresas do lote.
+        const generic = t === 'LOCACAO' || t === 'EQUIP' || t === 'MAQUINA';
+        const w = (generic ? 0.1 : 1) / (freq.get(t) || 1);
+        total += w;
+        if (hay.has(t)) {
+          matched += w;
+          if ((freq.get(t) || 0) < emps.length) specific++;
+        }
+      });
+      return { score: total ? matched / total : 0, matched, total, specific };
+    }
+
+    function bestTarget(row, companyIndex) {
+      const rowDigits = U.digits(row.descricao);
+      for (let j = 0; j < emps.length; j++) {
+        if (j !== companyIndex && cnpjs[j] && rowDigits.indexOf(cnpjs[j]) >= 0) return j;
+      }
+      const ranked = [];
+      for (let j = 0; j < emps.length; j++) {
+        if (j === companyIndex) continue;
+        const s = nameScore(row.descricao, j);
+        ranked.push({ target: j, score: s.score, matched: s.matched,
+          total: s.total, specific: s.specific });
+      }
+      ranked.sort((a, b) => b.score - a.score || b.matched - a.matched || b.total - a.total);
+      const best = ranked[0], second = ranked[1];
+      if (!best || best.score < NAME_THRESHOLD || !best.specific) return -1;
+      // Nomes realmente indistinguíveis ficam para conferência manual em vez
+      // de escolher uma empresa pela ordem de carregamento.
+      if (second && Math.abs(best.score - second.score) < 1e-9 &&
+          Math.abs(best.matched - second.matched) < 1e-9 &&
+          Math.abs(best.total - second.total) < 1e-9) return -1;
+      return best.target;
+    }
+
+    const assigned = rowsOf.map((rows, ci) => rows.map(r => {
+      const target = bestTarget(r, ci);
+      if (target < 0) return null;
+      return { company: emps[ci].id, companyIndex: ci, targetIndex: target,
+        rowId: r.rowId, desc: r.descricao, value: r.saldoAtual,
+        side: sideOf(r.descricao), balanceSide: r.balanceSide };
+    }).filter(Boolean));
+
+    const candidatos = (ci, cj) => assigned[ci].filter(r => r.targetIndex === cj);
 
     for (let i = 0; i < emps.length; i++) {
       for (let j = i + 1; j < emps.length; j++) {
@@ -156,7 +236,12 @@
           let best = -1, bestScore = -1;
           candB.forEach((b, ib) => {
             if (usedB.has(ib) || usedRow.has(b.rowId)) return;
-            let sc = 1;
+            // Um saldo recíproco válido reduz Ativo e Passivo pelo mesmo valor.
+            // Ativo↔Ativo ou Passivo↔Passivo é apenas uma coincidência de nomes
+            // (ou uma inconsistência na origem) e jamais deve ser eliminado.
+            if (a.balanceSide === b.balanceSide) return;
+            const maior = Math.max(Math.abs(a.value), Math.abs(b.value));
+            let sc = maior ? 1 - Math.abs(Math.abs(a.value) - Math.abs(b.value)) / maior : 0;
             if ((a.side === 'receber' && b.side === 'pagar') || (a.side === 'pagar' && b.side === 'receber')) sc += 2;
             if (sc > bestScore) { bestScore = sc; best = ib; }
           });
@@ -387,12 +472,28 @@
       if (/^RECEITAS? BRUTA/.test(k)) { m.receitaBruta = b; i++; continue; }
       if (/^DEDUC/.test(k)) { m.deducoes = b; i++; continue; }
       if (/^CUSTOS$/.test(k) || /^DESPESAS OPERACIONAIS$/.test(k)) {
+        const list = /^CUSTOS$/.test(k) ? m.custos : m.despesas;
+        // Se o bloco já traz as próprias contas analíticas, ele NÃO é um grupo
+        // contêiner: é uma sintética comum e entra como está.
+        if (b.analytics.length) { list.push(b); i++; continue; }
         // Grupo contêiner: consome os sub-blocos seguintes até a soma fechar
         // com o valor do grupo (membros podem variar por empresa).
-        const list = /^CUSTOS$/.test(k) ? m.custos : m.despesas;
-        let sum = 0; i++;
-        while (i < data.length && Math.abs(sum - b.value) > 0.02) { sum += data[i].value; list.push(data[i]); i++; }
-        continue;
+        let fim = -1, sum = 0;
+        if (Math.abs(b.value) <= 0.02) fim = i;              // grupo zerado: nada a consumir
+        else {
+          for (let j = i + 1; j < data.length; j++) {
+            sum += data[j].value;
+            if (Math.abs(sum - b.value) <= 0.02) { fim = j; break; }
+          }
+        }
+        if (fim >= 0) {
+          for (let j = i + 1; j <= fim; j++) list.push(data[j]);
+          i = fim + 1; continue;
+        }
+        // A soma nunca fechou: trata como bloco comum. Consumir "até acabar"
+        // engoliria o resto da DRE, deslocando todas as contas seguintes e
+        // falseando o resultado do exercício.
+        list.push(b); i++; continue;
       }
       if (/FINANCEIR/.test(k)) { m.financeiro.push(b); i++; continue; }
       if (/NAO OPERACION/.test(k) && /RECEITA/.test(k)) { m.naoOper.push(b); i++; continue; }
@@ -516,9 +617,16 @@
       const dif = calc - oficial;
       checks.push({ empresa, conta, calc, oficial, dif, ok: Math.abs(dif) <= 0.02 });
     };
+    let layoutCustosAntes = false;
     emps.forEach((emp, ci) => {
       const o = emp.dre.official || {};
-      chk(emp.id, 'Receita Líquida', lines[rlIdx].vals[ci], o.receitaLiquida);
+      // Quando o arquivo imprime os custos ANTES da Receita Líquida, a Receita
+      // Líquida dele já vem líquida de custos e não corresponde a nenhuma linha
+      // deste template. Compará-la com (Receita Bruta + Deduções) acusaria
+      // divergência numa DRE correta, então essa conferência é dispensada; as
+      // demais (Lucro Bruto, Resultado e Lucro Líquido) continuam valendo.
+      if (o.receitaLiquidaAposCustos) layoutCustosAntes = true;
+      else chk(emp.id, 'Receita Líquida', lines[rlIdx].vals[ci], o.receitaLiquida);
       chk(emp.id, 'Resultado Operacional Líquido (após custos)', lines[rol5Idx].vals[ci], o.lucroBruto);
       chk(emp.id, 'Resultado Operacional Líquido (após despesas)', lines[rol8Idx].vals[ci], o.resultadoOperacional);
       chk(emp.id, 'Lucro Líquido do Exercício', lines[llIdx].vals[ci], o.resultLiquido);
@@ -535,6 +643,10 @@
     if (resLiqEsperado !== undefined)
       chk('Consolidado', 'Lucro Líquido = ' + emps.map(e => e.id).join(' + '), resultLiquido, resLiqEsperado);
     const warnings = [];
+    if (layoutCustosAntes)
+      warnings.push('Em pelo menos uma DRE os custos vêm antes da Receita Líquida. ' +
+        'Nesse layout a Receita Líquida do arquivo já é líquida de custos, então essa linha ' +
+        'não foi comparada; a conferência usou o Lucro Bruto, o Resultado do Exercício e o Lucro Líquido.');
     if (!todosOficiais) {
       const faltam = emps.filter((e, ci) => !temOficial[ci]).map(e => 'Empresa ' + e.id);
       warnings.push('O Resultado Líquido oficial não foi identificado em ' +
